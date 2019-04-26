@@ -1,5 +1,5 @@
 # tristar.py Python 3 version
-Morningstar Tristar MPPT monitor
+Morningstar Tristar MPPT monitor, logging to Domoticz and/or CSV data file.
 
 Version 2.0
 

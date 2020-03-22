@@ -1,20 +1,20 @@
 #!/usr/bin/python3
+# Monitor Tristar MPPT solar charger and optionally log to Domoticz and/or CSV data file
 
-import time, datetime, urllib, urllib2, logging
+import time, datetime, requests, logging
 import os.path
 from pymodbus.client.sync import ModbusSerialClient as ModbusClient
 
 # Begin user editable variables
 logger_name = "tristar"   #used for log file names, messages, etc
-debug_level='debug'       # debug options DEBUG, INFO, WARNING, ERROR, CRITICAL
+debug_level='info'       # debug options DEBUG, INFO, WARNING, ERROR, CRITICAL
 delay_time = 30           #update time in seconds
-domain="http://rpi3:8080"
+domain="http://rpi4:8080"
 # Specify the serial client.  See /etc/udev/rules.d/99_usbdevices.rules for tristarUSB device
 client = ModbusClient(method='rtu', port='/dev/serial/by-id/usb-1a86_USB2.0-Ser_-if00-port0', baudrate=9600, parity = 'N', bytesize = 8, stopbits = 1)  # by-id replaces /dev/ttyUSB1
 # Define the device state list
 state = ['Start', 'Night Check', 'Disconnected', 'Night', 'Fault!', 'BulkCharge', 'Absorption', 'FloatCharge', 'Equalizing']
 monitor_list = ["batV","batI","statenum","pwrOut","batVmin","batVmax","ampH"]
-
 idx = [77,78,80,87,82,83,85]  # Domoticz index values for monitor_list
 dataFile_columns = "Time," + "Bat V," + "Bat I," + "Pwr In," + "AHr," + "State"   # set to empty "" to disable data logging to CSV file
 dailyFile_columns = "Date-Time,Bat V max,Bat V min,AHr,WHr,Abs T,Equ T,Flt T"
@@ -23,7 +23,8 @@ dailyFile_columns = "Date-Time,Bat V max,Bat V min,AHr,WHr,Abs T,Equ T,Flt T"
 log_path = os.path.dirname(os.path.realpath(__file__)) 
 dailyFile = log_path + "/" + logger_name + "_daily.csv"
 dataFile = log_path + "/" + logger_name + "_data.csv"
-batI = 0  # define current as global so it keeps previous value if invalid (159A bug)
+batI = 0                  # define current as global so it keeps previous value if invalid (159A bug)
+previous_out = ""         # variable to prevent logging the same values
 baseURL = domain + "/json.htm?type=command&param=udevice"
 log_level = getattr(logging, debug_level.upper(), 10)
 logging.basicConfig(filename=log_path + "/" + logger_name + ".log", level=log_level, format="%(asctime)s:%(name)s:%(levelname)s:%(message)s")
@@ -33,9 +34,8 @@ logger.warning(logger_name + " (re)started monitoring")
 
 class tristar:
   def __init__(self):
-
+    # Set up headers for log and daily files if required
     if dataFile_columns != "":
-      # Set up headers for log and daily files
       if not os.path.isfile(dataFile):
         out = dataFile_columns + "\n"
         try:
@@ -68,6 +68,8 @@ class tristar:
       return False   #raise SystemExit()
         
   def read_registers(self):
+    global batI
+    global previous_out
     nextDailyTime = datetime.datetime.combine(datetime.date.today() + self.one_day,datetime.time(23,55,0))
     if self.modbusConnect() == False:
       return False
@@ -93,7 +95,6 @@ class tristar:
     batV = '{:.2f}'.format(rr.registers[24] * v_scale)
     # fix intermittent 159A output, especially around dusk
     if rr.registers[28] * i_scale < 150:
-      global batI
       batI = '{:.2f}'.format(rr.registers[28] * i_scale)
     aryV = '{:.2f}'.format(rr.registers[27] * v_scale)
     aryI = '{:.2f}'.format(rr.registers[29] * i_scale)
@@ -120,31 +121,38 @@ class tristar:
         full_url = baseURL + "&idx={}&nvalue=0&svalue={}".format(idx[i],eval(monitor_list[i]))
         logger.debug("URL: {}".format(full_url))
         # Send the json string
-        urllib2.urlopen(full_url)
-    except urllib2.HTTPError as e:
+        response = requests.get(full_url)
+    except:
+      logger.error("Connection failed to {}".format(domain))
+   
+    #except urllib2.HTTPError as e:
       # Error checking to prevent crashing on bad requests
-      logger.error("HTTP error({}): {}".format(e.errno, e.strerror))
-    except urllib2.URLError as e:
-      logger.error("URL error({}): {}".format(e.errno, e.strerror))
-    out = time.strftime("%Y-%m-%d %H:%M") + "," + batV + "," + batI + "," + pwrIn + "," + ampH + "," + statenum + "\n"
-    try:
-      fil = open(dataFile, 'a')
-      fil.write(out)
-    except IOError as e:
-      logger.error("I/O error({}): {}".format(e.errno, e.strerror))
-    else:
-      fil.close()
+    #  logger.error("HTTP error({}): {}".format(e.errno, e.strerror))
+    #except requests.URLError as e:   #urllib2.URLError as e:
+    #  logger.error("URL error({}): {}".format(e.errno, e.strerror))
+    
+    if dataFile_columns != "":
+      out = time.strftime("%Y-%m-%d %H:%M") + "," + batV + "," + batI + "," + pwrIn + "," + ampH + "," + statenum + "\n"
+      if out[18:] != previous_out: # Don't log the data if it is identical (typically at night).
+        previous_out = out[18:]
+        try:
+          fil = open(dataFile, 'a')
+          fil.write(out)
+        except IOError as e:
+          logger.error("I/O error({}): {}".format(e.errno, e.strerror))
+        else:
+          fil.close()
 
-    if datetime.datetime.now() > nextDailyTime:
-      nextDailyTime = datetime.datetime.combine(datetime.date.today() + self.one_day,datetime.time(23,55,0))
-      out = time.strftime("%Y-%m-%d %H:%M") + "," + batVmin + "," + batVmax + "," + ampH + "," + watH + "," + absT  + "," + equT + "," + fltT + "\n"
-      try:
-        fil = open(dailyFile, 'a')
-        fil.write(out)
-      except IOError as e:
-        logger.error("I/O error({0}): {1}".format(e.errno, e.strerror))
-      else:
-        fil.close()
+        if datetime.datetime.now() > nextDailyTime:
+          nextDailyTime = datetime.datetime.combine(datetime.date.today() + self.one_day,datetime.time(23,55,0))
+          out = time.strftime("%Y-%m-%d %H:%M") + "," + batVmin + "," + batVmax + "," + ampH + "," + watH + "," + absT  + "," + equT + "," + fltT + "\n"
+          try:
+            fil = open(dailyFile, 'a')
+            fil.write(out)
+          except IOError as e:
+            logger.error("I/O error({0}): {1}".format(e.errno, e.strerror))
+          else:
+            fil.close()
 
 print("starting...")
 
